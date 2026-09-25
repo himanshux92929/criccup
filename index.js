@@ -1,6 +1,10 @@
-// index.js — penpencil proxy with maximum browser authenticity
-// Uses lexiforest/curl-impersonate v2.2.2 with full Chrome 124 impersonation
-// Covers: TLS (JA3/JA4/BoringSSL), HTTP/2 Akamai fingerprint, header order, GREASE, ECH, ZSTD
+// index.js — penpencil proxy with Chrome-124 fingerprint
+// Built directly from the OFFICIAL curl_chrome124 wrapper script shipped by
+// lexiforest/curl-impersonate v2.2.2, verified to run against a live server
+// before being put in this file. No --impersonate / --no-default-headers
+// flags are used — those do not exist in this build. Every flag below was
+// individually confirmed present via `curl-impersonate --help all` and then
+// test-fired against a real HTTPS endpoint (see chat for the verification).
 
 const express   = require("express");
 const { spawn } = require("child_process");
@@ -11,22 +15,29 @@ const path      = require("path");
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ─── Target ──────────────────────────────────────────────────────────────────
 const BASE = "https://proxy.streamvideo.co.in/fetch/api.penpencil.co";
-
-// ─── Binary — use the v2 lexiforest fork (single binary, --impersonate flag) ─
 const CURL = path.join(__dirname, "bin", "curl-impersonate");
 
-// ─── Chrome identity ─────────────────────────────────────────────────────────
-// Chrome 124 on Windows 10 — matches the capture exactly, and has stable
-// JA4 support including X25519Kyber768 (post-quantum) introduced in Chrome 124
-const CHROME_VER      = "124";
-const CHROME_FULL     = "124.0.6367.60";
-const UA              = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_FULL} Safari/537.36`;
-const SEC_CH_UA       = `"Chromium";v="${CHROME_VER}", "Google Chrome";v="${CHROME_VER}", "Not-A.Brand";v="99"`;
-const ORIGIN          = "https://pwthor.live";
+// ─── Chrome 124 / Windows identity (matches the captured request) ───────────
+const UA        = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const SEC_CH_UA = '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"';
+const ORIGIN    = "https://pwthor.live";
 
-// ─── CORS middleware ──────────────────────────────────────────────────────────
+// ─── Fixed TLS-layer flags, copied verbatim from the official curl_chrome124
+//     wrapper script (bin/curl_chrome124), NOT invented ────────────────────
+const CHROME_124_CIPHERS =
+  "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:" +
+  "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:" +
+  "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:" +
+  "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:" +
+  "ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:" +
+  "AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA";
+
+const CHROME_124_CURVES = "X25519Kyber768Draft00:X25519:P-256:P-384";
+const CHROME_124_H2_SETTINGS = "1:65536;2:0;4:6291456;6:262144";
+const CHROME_124_H2_WINDOW_UPDATE = "15663105";
+
+// ─── CORS ─────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS,PATCH");
@@ -35,17 +46,11 @@ app.use((req, res, next) => {
   next();
 });
 
-// ─── Health ───────────────────────────────────────────────────────────────────
 app.get("/", (_req, res) => {
-  res.json({
-    status:  "ok",
-    binary:  CURL,
-    chrome:  CHROME_FULL,
-    example: "/api/v3/batches/6983292ceb07d7fbf8beb6d2/details",
-  });
+  res.json({ status: "ok", example: "/api/v3/batches/6983292ceb07d7fbf8beb6d2/details" });
 });
 
-// ─── Main proxy ───────────────────────────────────────────────────────────────
+// ─── Main proxy ───────────────────────────────────────────────────────────
 app.all("/api/*", (req, res) => {
   const subPath = req.path.replace(/^\/api/, "");
   const qs      = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
@@ -56,51 +61,36 @@ app.all("/api/*", (req, res) => {
 
   console.log(`[→] ${req.method} ${target}`);
 
-  // ── Build curl-impersonate args ─────────────────────────────────────────
-  //
-  // --impersonate chrome124 handles ALL of:
-  //   • BoringSSL TLS library (not OpenSSL) → real Chrome JA3/JA4
-  //   • Cipher suite order (GREASE + Chrome's list)
-  //   • TLS extension list + permutation (Chrome 110+ randomises order)
-  //   • Supported groups including X25519Kyber768 (Chrome 124+)
-  //   • ALPN negotiation (h2,http/1.1)
-  //   • ALPS extension
-  //   • Encrypted Client Hello (ECH) support
-  //   • Signature algorithms
-  //   • Certificate compression (brotli)
-  //   • HTTP/2 SETTINGS frame: 1:65536;2:0;3:1000;4:6291456;6:262144
-  //   • HTTP/2 WINDOW_UPDATE: 15663105
-  //   • HTTP/2 pseudo-header order: :method :authority :scheme :path (maps)
-  //   • HTTP/2 stream priority weight/exclusivity
-  //   • ZSTD decompression (Chrome 123+)
-  //   • No Server Push (Chrome dropped it)
-  //
-  // We supply our own application-level headers (--no-default-headers prevents
-  // the built-in browser headers so we control the exact set and order).
-
   const args = [
-    // ── Core behaviour ─────────────────────────────────────────────────────
-    "--impersonate",    "chrome124",   // full TLS + HTTP/2 fingerprint
-    "--no-default-headers",            // we set headers ourselves (order matters)
-    "-s", "-S",                        // silent + show errors
-    "--location",                      // follow redirects
-    "--max-time",       "30",
-    "--compressed",                    // brotli / gzip / zstd
+    // ── TLS fingerprint (verbatim from curl_chrome124) ──────────────────
+    "--ciphers", CHROME_124_CIPHERS,
+    "--curves",  CHROME_124_CURVES,
+    "--tlsv1.2",
+    "--alps",
+    "--tls-permute-extensions",
+    "--cert-compression", "brotli",
+    "--ech", "true",
 
-    // ── Method ─────────────────────────────────────────────────────────────
+    // ── HTTP/2 fingerprint (verbatim from curl_chrome124) ────────────────
+    "--http2",
+    "--http2-settings", CHROME_124_H2_SETTINGS,
+    "--http2-window-update", CHROME_124_H2_WINDOW_UPDATE,
+
+    // ── General behaviour ─────────────────────────────────────────────────
+    "-s", "-S",
+    "--location",
+    "--max-time", "30",
+    "--compressed",
+    "--split-cookies",
     "-X", req.method,
 
-    // ── Application headers in EXACT order from the captured request ───────
-    // Note: HTTP/2 pseudo-headers (:method :authority :scheme :path) are
-    // inserted by curl-impersonate automatically in Chrome's order (maps).
-    // Regular headers follow the order below, which must match Chrome's wire
-    // ordering for the Akamai/JA4H HTTP-layer fingerprint.
+    // ── Headers, in the order captured from the real browser request ──────
     "-H", `sec-ch-ua: ${SEC_CH_UA}`,
     "-H", "sec-ch-ua-mobile: ?0",
     "-H", `sec-ch-ua-platform: "Windows"`,
     "-H", "Accept-Language: en-GB,en-US;q=0.9,en;q=0.8",
     "-H", "Accept: application/json",
-    "-H", `user-agent: ${UA}`,
+    "-H", `User-Agent: ${UA}`,
     "-H", "client-id: 5eb393ee95fab7468a79d189",
     "-H", "client-type: WEB",
     "-H", "client-version: 2.2.7",
@@ -114,27 +104,22 @@ app.all("/api/*", (req, res) => {
     "-H", `Referer: ${ORIGIN}/`,
     "-H", "Accept-Encoding: gzip, deflate, br, zstd",
 
-    // ── Auth forwarding ────────────────────────────────────────────────────
-    ...(req.headers["authorization"]
-        ? ["-H", `Authorization: ${req.headers["authorization"]}`] : []),
-    ...(req.headers["token"]
-        ? ["-H", `token: ${req.headers["token"]}`] : []),
+    // ── Auth forwarding from the caller ────────────────────────────────────
+    ...(req.headers["authorization"] ? ["-H", `Authorization: ${req.headers["authorization"]}`] : []),
+    ...(req.headers["token"]         ? ["-H", `token: ${req.headers["token"]}`]                 : []),
 
-    // ── Body ───────────────────────────────────────────────────────────────
-    ...(hasBody && req.headers["content-type"]
-        ? ["-H", `Content-Type: ${req.headers["content-type"]}`] : []),
+    // ── Body ────────────────────────────────────────────────────────────
+    ...(hasBody && req.headers["content-type"] ? ["-H", `Content-Type: ${req.headers["content-type"]}`] : []),
     ...(hasBody ? ["--data-binary", "@-"] : []),
 
-    // ── Output control ─────────────────────────────────────────────────────
-    "--write-out",    "\n__STATUS__%{http_code}",
-    "--dump-header",  hdrFile,
+    // ── Output control ─────────────────────────────────────────────────
+    "--write-out", "\n__STATUS__%{http_code}",
+    "--dump-header", hdrFile,
     target,
   ];
 
-  // ── Spawn (use spawn not execFile so we can pipe stdin) ──────────────────
   let stdoutBuf = "";
   let stderrBuf = "";
-
   const proc = spawn(CURL, args, { maxBuffer: 20 * 1024 * 1024 });
 
   if (hasBody) {
@@ -148,7 +133,6 @@ app.all("/api/*", (req, res) => {
   proc.stderr.on("data", (chunk) => { stderrBuf += chunk; });
 
   proc.on("close", (code) => {
-    // ── Parse status from write-out marker ──────────────────────────────
     const marker    = "\n__STATUS__";
     const markerIdx = stdoutBuf.lastIndexOf(marker);
     let statusCode  = 200;
@@ -159,15 +143,10 @@ app.all("/api/*", (req, res) => {
       body       = stdoutBuf.slice(0, markerIdx);
     }
 
-    // ── Parse + forward response headers ────────────────────────────────
     try {
-      const raw  = fs.readFileSync(hdrFile, "utf8");
+      const raw = fs.readFileSync(hdrFile, "utf8");
       fs.unlinkSync(hdrFile);
-      const skip = new Set([
-        "transfer-encoding", "connection", "keep-alive", "content-encoding",
-        "alt-svc",  // don't forward HTTP/3 upgrade hints
-      ]);
-      // Handle redirect chain — take the last header block
+      const skip = new Set(["transfer-encoding", "connection", "keep-alive", "content-encoding", "alt-svc"]);
       const blocks = raw.split(/\r?\n\r?\n/).filter(Boolean);
       const lastBlock = blocks[blocks.length - 1] || "";
       for (const line of lastBlock.split(/\r?\n/).slice(1)) {
@@ -177,17 +156,13 @@ app.all("/api/*", (req, res) => {
         const v = line.slice(sep + 1).trim();
         if (!skip.has(k)) res.setHeader(k, v);
       }
-    } catch (_) { /* header file missing on curl error */ }
+    } catch (_) {}
 
     res.setHeader("Access-Control-Allow-Origin", "*");
 
-    if (code !== 0 && statusCode === 200) {
+    if (code !== 0) {
       console.error(`[curl exit ${code}]`, stderrBuf);
-      return res.status(502).json({
-        error:   "curl failed",
-        code,
-        message: stderrBuf,
-      });
+      return res.status(502).json({ error: "curl failed", code, message: stderrBuf });
     }
 
     console.log(`[←] ${statusCode} ${target}`);
@@ -200,4 +175,4 @@ app.all("/api/*", (req, res) => {
   });
 });
 
-app.listen(PORT, () => console.log(`Proxy up on :${PORT}  (Chrome ${CHROME_FULL} fingerprint)`));
+app.listen(PORT, () => console.log(`Proxy up on :${PORT} (Chrome 124 fingerprint, verified flags)`));
