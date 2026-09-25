@@ -1,19 +1,13 @@
 {
-  "name": "proxy-app",
+  "name": "penpencil-proxy",
   "version": "1.0.0",
-  "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node index.js"
+    "start": "node index.js",
+    "build": "bash setup.sh"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "dependencies": {
-    "express": "^5.2.1",
-    "node-fetch": "^2.7.0",
-    "undici": "^8.11.2"
+    "express": "^4.18.2"
   },
   "engines": {
     "node": ">=18.0.0"
